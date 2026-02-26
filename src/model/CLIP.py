@@ -40,6 +40,8 @@ class DEC_CLIPConfig(PretrainedConfig):
         t_prime: float = np.log(1 / 0.07),
         bias: float = 0.0,
         efficient_loss: bool = False,
+        use_masking: bool = False,   
+        mask_ratio: float = 0.7,        
         **kwargs,
     ):
         self.language_model_name_or_path = language_model_name_or_path
@@ -54,8 +56,57 @@ class DEC_CLIPConfig(PretrainedConfig):
         self.t_prime = t_prime
         self.bias = bias
         self.efficient_loss = efficient_loss
+        self.use_masking = use_masking
+        self.mask_ratio = mask_ratio
         super().__init__(**kwargs)
 
+class SaliencyPruner(nn.Module):
+    def __init__(self, embed_dim, keep_ratio=0.7): # Start conservative (0.7)
+        super().__init__()
+        self.keep_ratio = keep_ratio
+        self.scorer = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 4),
+            nn.ReLU(),
+            nn.Linear(embed_dim // 4, 1),
+            nn.Sigmoid() 
+        )
+
+    def forward(self, x):
+        """
+        x: [B, N, D]
+        Returns: 
+        - x_kept: [B, K, D] (The pruned tokens)
+        - sparsity_loss: Scalar tensor to force binary decisions
+        """
+        B, N, D = x.shape
+        scores = self.scorer(x) # [B, N, 1]
+        
+        # --- The Gradient Trick ---
+        # We multiply x by scores so gradients flow to the scorer.
+        # If score is low, the feature becomes 0, affecting the CLIP loss.
+        x_weighted = x * scores 
+
+        # Determine K
+        k = int(N * self.keep_ratio)
+        
+        # Select Top-K
+        # Flatten scores to [B, N] for topk
+        score_values = scores.squeeze(-1)
+        top_k_scores, top_k_indices = torch.topk(score_values, k, dim=1)
+        
+        # Sort indices to preserve relative spatial ordering (crucial for some encoders)
+        top_k_indices, _ = torch.sort(top_k_indices, dim=1)
+        
+        # Gather the weighted tokens
+        # We use the indices to select from x_weighted
+        batch_indices = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, k)
+        x_kept = x_weighted[batch_indices, top_k_indices, :]
+        
+        # Sparsity Loss: Force scores towards 0 or 1 (prevent them from getting stuck at 0.5)
+        # This helps the model make "hard" decisions
+        sparsity_loss = torch.mean(torch.abs(score_values - 0.5)) * -1.0 
+        
+        return x_kept, sparsity_loss
 
 class DEC_CLIP(PreTrainedModel):
     config_class = DEC_CLIPConfig
@@ -87,6 +138,13 @@ class DEC_CLIP(PreTrainedModel):
             self.language_encoder.config.dim, config.hidden_size
         )
 
+        self.use_masking = getattr(config, "use_masking", False)
+        if self.use_masking:
+            self.pruner = SaliencyPruner(
+                embed_dim=self.vision_encoder.channels[-1], 
+                keep_ratio=getattr(config, "mask_ratio", 0.7)
+            )
+
         self.efficient_loss = config.efficient_loss
         self.local_loss = config.local_loss
         self.gather_loss = config.gather_loss
@@ -102,11 +160,40 @@ class DEC_CLIP(PreTrainedModel):
         image_feats = self.vision_encoder(image)
         if isinstance(image_feats, list):
             image_feats = image_feats[-1]
+            
+        sparsity_loss = 0.0
+        if self.use_masking:
+            # image_feats is [B, N, D]
+            image_feats, sparsity_loss = self.pruner(image_feats)
+            
+        # Global Average Pooling
+        # Note: We are now averaging only the "important" tokens
         image_feats = image_feats.mean(dim=1)
+        
         image_feats = self.mm_vision_proj(image_feats)
         image_feats = F.normalize(image_feats, dim=-1)
 
-        return image_feats
+        # Return tuple if masking is on, else tensor (to maintain back-compat if needed)
+        # Ideally, always return tuple internally
+        return image_feats, sparsity_loss
+    
+    def visualize_mask(self, images):
+        """
+        Extracts the raw saliency scores so we can map them back to the 3D volume
+        and see what the model is actually looking at.
+        """
+        self.eval() # Must be in eval mode
+        with torch.no_grad():
+            image_feats = self.vision_encoder(images)
+            if isinstance(image_feats, list):
+                image_feats = image_feats[-1]
+                
+            if getattr(self, "use_masking", False) == False:
+                raise ValueError("Model is not configured with use_masking=True")
+                
+            # Get the scores [B, N, 1] -> [B, N]
+            scores = self.pruner.scorer(image_feats).squeeze(-1)
+            return scores
 
     def encode_text(self, input_id, attention_mask):
         text_feats = self.language_encoder(input_id, attention_mask=attention_mask)[
@@ -119,7 +206,7 @@ class DEC_CLIP(PreTrainedModel):
         return text_feats
 
     def forward(self, images, input_ids, attention_mask, labels, **kwargs):
-        image_features = self.encode_image(images)
+        image_features, sparsity_loss = self.encode_image(images)
         text_features = self.encode_text(input_ids, attention_mask)
 
         rank = 0
@@ -240,6 +327,9 @@ class DEC_CLIP(PreTrainedModel):
 
             loss = (image_loss + text_loss) / 2.0
             logits = ((logits_per_image + logits_per_text) / 2.0,)
+
+        if self.use_masking:
+            loss = loss + (0.1 * sparsity_loss)
 
         ret = {
             "loss": loss,
