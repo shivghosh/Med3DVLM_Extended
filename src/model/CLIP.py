@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel,AutoModelForCausalLM
 
 from src.model.encoder.dcformer import (
     decomp_base,
@@ -127,16 +127,20 @@ class DEC_CLIP(PreTrainedModel):
         else:
             raise ValueError(f"Unexpected vision encoder: {config.vision_encoder}")
 
-        self.language_encoder = AutoModel.from_pretrained(
-            config.language_model_name_or_path
+        self.language_encoder = AutoModelForCausalLM.from_pretrained(
+            config.language_model_name_or_path,
+            trust_remote_code=True,
+            local_files_only=True
         )
 
         self.mm_vision_proj = nn.Linear(
             self.vision_encoder.channels[-1], config.hidden_size
         )
-        self.mm_language_proj = nn.Linear(
-            self.language_encoder.config.dim, config.hidden_size
-        )
+        # This ensures it automatically adapts to whatever model you load
+        hidden_size = self.language_encoder.config.hidden_size
+        projection_dim = 512 # Or whatever config.projection_dim variable was there originally
+
+        self.mm_language_proj = nn.Linear(hidden_size, projection_dim)
 
         self.use_masking = getattr(config, "use_masking", False)
         if self.use_masking:
@@ -196,10 +200,16 @@ class DEC_CLIP(PreTrainedModel):
             return scores
 
     def encode_text(self, input_id, attention_mask):
-        text_feats = self.language_encoder(input_id, attention_mask=attention_mask)[
-            "last_hidden_state"
-        ]
+        outputs = self.language_encoder(
+            input_id, 
+            attention_mask=attention_mask, 
+            output_hidden_states=True
+        )
+        text_feats = outputs.hidden_states[-1]
         text_feats = text_feats[:, 0]
+        # Dynamically get the dtype of the projection layer and cast the input to match
+        target_dtype = next(self.mm_language_proj.parameters()).dtype
+        text_feats = text_feats.to(target_dtype)
         text_feats = self.mm_language_proj(text_feats)
         text_feats = F.normalize(text_feats, dim=-1)
 
